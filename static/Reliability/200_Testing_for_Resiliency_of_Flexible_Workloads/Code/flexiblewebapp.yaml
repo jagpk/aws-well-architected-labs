@@ -1,7 +1,7 @@
 ﻿AWSTemplateFormatVersion: 2010-09-09
 Description: >-
-  AWS CloudFormation Sample Template for a static web app. This template installs a highly-available, scalable web application deployment.
-  It demonstrates using the AWS CloudFormation bootstrap scripts to deploy a stateless web application.
+  AWS CloudFormation Sample Template for a static web app. This template installs a highly-available, scalable and flexible web application deployment.
+  It demonstrates using the AWS CloudFormation bootstrap scripts to deploy a stateless web application flexible to run on multiple instance types.
 
   **WARNING** You will be billed for the AWS resources created if you create a stack from this template.
 
@@ -22,7 +22,7 @@ Parameters:
   NamingPrefix:
     Type: String
     Description: The naming prefix for resources created by this template.
-    Default: WebApp1
+    Default: WebApp-Flexible
   #Imports:
   VPCImportName:
     Type: String
@@ -55,17 +55,6 @@ Parameters:
     Description: 'The name of the subnet from VPC stack to import'
     Default: 'ALB1Subnet3'
   #Application Tier
-  InstanceType:
-    Description: WebServer EC2 instance type
-    Type: String
-    Default: t3.micro
-    AllowedValues:
-      - t3.nano
-      - t3.micro
-      - t3.small
-      - t3.medium
-      - t3.large
-    ConstraintDescription: must be a valid EC2 instance type.
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
@@ -78,12 +67,19 @@ Parameters:
     AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
     ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
   Web1AutoScaleDesired:
-    Default: '2'
+    Default: '4'
     Description: The desired number of web instances in auto scaling group
     Type: Number
-    MinValue: '2'
+    MinValue: '4'
     MaxValue: '6'
-    ConstraintDescription: must be between 2 and 6 EC2 instances.
+    ConstraintDescription: must be between 4 and 6 EC2 instances.
+  Web1CPUPolicyTargetValue:
+    Default: '60'
+    Description: The Avg. CPU utilization for auto scaling group scaling policy
+    Type: Number
+    MinValue: '50'
+    MaxValue: '90'
+    ConstraintDescription: must be between 50 and 90 Avg. CPU utilization.
 Resources:
   ALB1SecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
@@ -155,7 +151,7 @@ Resources:
         #-
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
-          Value: 10
+          Value: 90
       UnhealthyThresholdCount: 3
       # Targets:
       #   - TargetDescription
@@ -213,6 +209,8 @@ Resources:
               Version: !GetAtt Web1LaunchTemplate.LatestVersionNumber
             Overrides: 
               - InstanceRequirements:
+                  #ExcludedInstanceTypes: 
+                  #  - String
                   InstanceGenerations: 
                     - current
                   MemoryMiB: 
@@ -221,7 +219,7 @@ Resources:
                   VCpuCount: 
                     Max: 2
                     Min: 2
-      MinSize: '1'
+      MinSize: '4'
       MaxSize: '9'
       DesiredCapacity: !Ref Web1AutoScaleDesired
       CapacityRebalance: 'true'
@@ -231,6 +229,8 @@ Resources:
         - Key: Name
           Value: !Sub '${NamingPrefix}'
           PropagateAtLaunch: true
+      MetricsCollection:
+        -   Granularity: 1Minute
     UpdatePolicy:
       AutoScalingReplacingUpdate:
         WillReplace: 'true'
@@ -238,6 +238,17 @@ Resources:
       #   MinInstancesInService: '3'
       #   MaxBatchSize: '2'
       #   PauseTime: PT5M
+
+  Web1ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Web1AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref Web1CPUPolicyTargetValue
+
   Web1LaunchTemplate:
     Type: 'AWS::EC2::LaunchTemplate'
     #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-launchtemplate.html
@@ -406,6 +417,69 @@ Resources:
       Path: /Web1InstanceEc2Role/
       Roles:
         - !Ref Web1InstanceRole
+
+  FIS1SpotRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${NamingPrefix}-FIS-Spot'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - fis.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      #To simplify management of the role we will use inline policies: https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html
+      Policies:
+        - PolicyName: fis-spot
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstanceStatus'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:SendSpotInstanceInterruptions'
+                Resource: 'arn:aws:ec2:*:*:instance/*'
+
+  FisTemplatedSpotInstance:
+    Type: AWS::FIS::ExperimentTemplate
+    # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-fis-experimenttemplate.html
+    Properties:
+      Description: Interrupt all running Spot Instances in a single AZ
+      RoleArn: !GetAtt FIS1SpotRole.Arn
+      StopConditions:
+        - Source: none
+      Tags:
+        Name: InterruptSpotInstances
+      Targets:
+        instanceTargets:
+          ResourceTags: 
+            aws:autoscaling:groupName: !Ref Web1AutoScalingGroup
+          ResourceType: aws:ec2:spot-instance
+          Filters:
+            - Path: Placement.AvailabilityZone
+              Values: 
+                - !Select 
+                  - 0
+                  - Fn::GetAZs: !Ref 'AWS::Region'
+            - Path: State.Name
+              Values: 
+                - running
+          SelectionMode: ALL
+      Actions:
+        instanceActions:
+          ActionId: aws:ec2:send-spot-instance-interruptions
+          Parameters:
+            durationBeforeInterruption: PT5M
+          Targets:
+            SpotInstances: instanceTargets
+
 Outputs:
   WebsiteURL:
     Value: !Join
@@ -440,6 +514,5 @@ Metadata:
           default: "Application Tier Configuration"
         Parameters:
           - LatestAmiId
-          - InstanceType
           - Web1AutoScaleDesired
           - ALBSGSource
